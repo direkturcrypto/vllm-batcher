@@ -14,12 +14,18 @@ const MODEL = process.env.MODEL || 'nvidia/Llama-3.1-Nemotron-Nano-8B-v1';
 const MAX_CONTEXT_LENGTH = process.env.MAX_CONTEXT_LENGTH || 8192; // Maximum context length for the model
 const DEFAULT_MAX_TOKENS = 512; // Default max tokens for completion
 const BATCH_SIZE = 50; // Number of requests to process in each batch
+const BATCH_INTERVAL = 500; // Process batch every 500ms
+const MAX_QUEUE_SIZE = 1000; // Maximum number of requests in queue
+const MAX_CONCURRENT_REQUESTS = 200; // Maximum number of concurrent requests to VLLM
+const VLLM_STATUS_CHECK_INTERVAL = 5000; // Check VLLM status every 5 seconds
 
-// Request queues
+// Request queues and status
 let requestQueue = [];
 let streamRequestQueue = [];
 let isProcessing = false;
 let isStreamProcessing = false;
+let activeRequests = 0;
+let isVLLMAvailable = true;
 
 // Middleware
 app.use(bodyParser.json());
@@ -100,15 +106,28 @@ function normalizeMessages(messages) {
     return finalMessages;
 }
 
+// Function to check VLLM server status
+async function checkVLLMStatus() {
+    try {
+        const response = await axios.get(VLLM_ENDPOINT.replace('/v1/chat/completions', '/health'));
+        isVLLMAvailable = response.status === 200;
+    } catch (error) {
+        isVLLMAvailable = false;
+        console.error('VLLM server is not available:', error.message);
+    }
+}
+
+// Start VLLM status checking
+setInterval(checkVLLMStatus, VLLM_STATUS_CHECK_INTERVAL);
+
 // Function to process non-streaming batch
 async function processBatch() {
-    if (requestQueue.length === 0 || isProcessing) return;
+    if (requestQueue.length === 0 || isProcessing || !isVLLMAvailable || activeRequests >= MAX_CONCURRENT_REQUESTS) return;
 
     isProcessing = true;
     const batch = requestQueue.splice(0, BATCH_SIZE);
 
     try {
-        // Process all requests in the batch in parallel
         const requests = batch.map(req => {
             const normalizedMessages = normalizeMessages(req.body.messages);
             const maxTokens = Math.min(
@@ -132,6 +151,8 @@ async function processBatch() {
             };
         });
 
+        activeRequests += requests.length;
+
         // Send all requests in parallel
         const responses = await Promise.all(
             requests.map(async (r, index) => {
@@ -140,6 +161,8 @@ async function processBatch() {
                     return { index, data: response.data };
                 } catch (error) {
                     return { index, error: error.response?.data || error.message };
+                } finally {
+                    activeRequests--;
                 }
             })
         );
@@ -155,28 +178,22 @@ async function processBatch() {
             })
         );
     } catch (error) {
-        // Handle any errors in parallel
         await Promise.all(
             batch.map(req => req.reject(error.response?.data || error.message))
         );
     } finally {
         isProcessing = false;
-        // Process next batch if there are remaining requests
-        if (requestQueue.length > 0) {
-            processBatch();
-        }
     }
 }
 
 // Function to process streaming batch
 async function processStreamBatch() {
-    if (streamRequestQueue.length === 0 || isStreamProcessing) return;
+    if (streamRequestQueue.length === 0 || isStreamProcessing || !isVLLMAvailable || activeRequests >= MAX_CONCURRENT_REQUESTS) return;
 
     isStreamProcessing = true;
     const batch = streamRequestQueue.splice(0, BATCH_SIZE);
 
     try {
-        // Process all requests in the batch in parallel
         const requests = batch.map(req => {
             const normalizedMessages = normalizeMessages(req.body.messages);
             const maxTokens = Math.min(
@@ -199,6 +216,8 @@ async function processStreamBatch() {
                 user: req.body.user
             };
         });
+
+        activeRequests += requests.length;
 
         // Send all requests in parallel
         const responses = await Promise.all(
@@ -243,6 +262,8 @@ async function processStreamBatch() {
                     } else {
                         return { index, error: error.message };
                     }
+                } finally {
+                    activeRequests--;
                 }
             })
         );
@@ -253,7 +274,6 @@ async function processStreamBatch() {
                 const { res } = batch[index];
                 let isEnded = false;
 
-                // Set SSE headers
                 res.setHeader('Content-Type', 'text/event-stream');
                 res.setHeader('Cache-Control', 'no-cache');
                 res.setHeader('Connection', 'keep-alive');
@@ -341,7 +361,6 @@ async function processStreamBatch() {
             })
         );
     } catch (error) {
-        // Handle any errors in parallel
         await Promise.all(
             batch.map(req => {
                 if (!req.res.writableEnded) {
@@ -353,10 +372,6 @@ async function processStreamBatch() {
         );
     } finally {
         isStreamProcessing = false;
-        // Process next batch if there are remaining requests
-        if (streamRequestQueue.length > 0) {
-            processStreamBatch();
-        }
     }
 }
 
@@ -364,26 +379,15 @@ async function processStreamBatch() {
 app.post('/v1/chat/completions', async (req, res) => {
     try {
         if (req.body.stream) {
-            // Add to stream queue and process if not already processing
             streamRequestQueue.push({ body: req.body, res });
-            if (!isStreamProcessing) {
-                processStreamBatch();
-            }
         } else {
-            // Non-streaming request - wait for the response before sending
             const response = await new Promise((resolve, reject) => {
                 requestQueue.push({
                     body: req.body,
                     resolve,
                     reject
                 });
-                // Process if not already processing
-                if (!isProcessing) {
-                    processBatch();
-                }
             });
-            
-            // Only send response after getting the VLLM response
             res.json(response);
         }
     } catch (error) {
@@ -397,6 +401,10 @@ app.post('/v1/chat/completions', async (req, res) => {
         }
     }
 });
+
+// Start batch processing intervals
+setInterval(processBatch, BATCH_INTERVAL);
+setInterval(processStreamBatch, BATCH_INTERVAL);
 
 // Start the server
 app.listen(port, () => {
