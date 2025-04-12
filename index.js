@@ -13,7 +13,7 @@ const VLLM_ENDPOINT = `${process.env.VLLM_ENDPOINT || 'http://localhost:8080'}/v
 const MODEL = process.env.MODEL || 'nvidia/Llama-3.1-Nemotron-Nano-8B-v1';
 const BATCH_INTERVAL = process.env.BATCH_INTERVAL || 100; // milliseconds
 const MAX_CONTEXT_LENGTH = process.env.MAX_CONTEXT_LENGTH || 8192; // Maximum context length for the model
-const DEFAULT_MAX_TOKENS = 512; // Default max tokens for completion
+const DEFAULT_MAX_TOKENS = 1024; // Default max tokens for completion
 
 // Request queues
 let requestQueue = [];
@@ -105,8 +105,9 @@ async function processBatch() {
     if (requestQueue.length === 0 || isProcessing) return;
 
     isProcessing = true;
-    const batch = [...requestQueue];
-    requestQueue = [];
+    // Take only first 50 requests
+    const batch = requestQueue.splice(0, 50);
+    // The remaining requests will stay in the queue for next processing
 
     try {
         const requests = batch.map(req => {
@@ -165,8 +166,9 @@ async function processStreamBatch() {
     if (streamRequestQueue.length === 0 || isStreamProcessing) return;
 
     isStreamProcessing = true;
-    const batch = [...streamRequestQueue];
-    streamRequestQueue = [];
+    // Take only first 50 requests
+    const batch = streamRequestQueue.splice(0, 50);
+    // The remaining requests will stay in the queue for next processing
 
     try {
         const requests = batch.map(req => {
