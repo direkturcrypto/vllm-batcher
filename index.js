@@ -105,16 +105,15 @@ async function processBatch() {
     if (requestQueue.length === 0 || isProcessing) return;
 
     isProcessing = true;
-    // Take only first BATCH_SIZE requests
     const batch = requestQueue.splice(0, BATCH_SIZE);
-    // The remaining requests will stay in the queue for next processing
 
     try {
+        // Process all requests in the batch in parallel
         const requests = batch.map(req => {
             const normalizedMessages = normalizeMessages(req.body.messages);
             const maxTokens = Math.min(
                 req.body.max_tokens || DEFAULT_MAX_TOKENS,
-                MAX_CONTEXT_LENGTH - 1000 // Leave some room for the prompt
+                MAX_CONTEXT_LENGTH - 1000
             );
 
             return {
@@ -133,29 +132,33 @@ async function processBatch() {
             };
         });
 
+        // Send all requests in parallel
         const responses = await Promise.all(
             requests.map(async (r, index) => {
                 try {
                     const response = await axios.post(VLLM_ENDPOINT, r);
-                    return response.data;
+                    return { index, data: response.data };
                 } catch (error) {
-                    console.error(`Error in request ${index}:`, error.response?.data || error.message);
-                    return { error: error.response?.data || error.message };
+                    return { index, error: error.response?.data || error.message };
                 }
             })
         );
 
-        batch.forEach((req, index) => {
-            if (responses[index]?.error) {
-                req.reject(responses[index].error);
-            } else {
-                req.resolve(responses[index]);
-            }
-        });
+        // Resolve/reject all promises in parallel
+        await Promise.all(
+            responses.map(({ index, data, error }) => {
+                if (error) {
+                    return batch[index].reject(error);
+                } else {
+                    return batch[index].resolve(data);
+                }
+            })
+        );
     } catch (error) {
-        batch.forEach(req => {
-            req.reject(error.response?.data || error.message);
-        });
+        // Handle any errors in parallel
+        await Promise.all(
+            batch.map(req => req.reject(error.response?.data || error.message))
+        );
     } finally {
         isProcessing = false;
         // Process next batch if there are remaining requests
@@ -170,16 +173,15 @@ async function processStreamBatch() {
     if (streamRequestQueue.length === 0 || isStreamProcessing) return;
 
     isStreamProcessing = true;
-    // Take only first BATCH_SIZE requests
     const batch = streamRequestQueue.splice(0, BATCH_SIZE);
-    // The remaining requests will stay in the queue for next processing
 
     try {
+        // Process all requests in the batch in parallel
         const requests = batch.map(req => {
             const normalizedMessages = normalizeMessages(req.body.messages);
             const maxTokens = Math.min(
                 req.body.max_tokens || DEFAULT_MAX_TOKENS,
-                MAX_CONTEXT_LENGTH - 1000 // Leave some room for the prompt
+                MAX_CONTEXT_LENGTH - 1000
             );
 
             return {
@@ -198,17 +200,15 @@ async function processStreamBatch() {
             };
         });
 
+        // Send all requests in parallel
         const responses = await Promise.all(
             requests.map(async (r, index) => {
                 try {
-                    const response = await axios.post(VLLM_ENDPOINT, r, { 
+                    const response = await axios.post(VLLM_ENDPOINT, r, {
                         responseType: 'stream',
-                        validateStatus: function (status) {
-                            return status >= 200 && status < 500; // Accept all status codes less than 500
-                        }
+                        validateStatus: status => status >= 200 && status < 500
                     });
 
-                    // Check if response is an error
                     if (response.status >= 400) {
                         let errorData = '';
                         for await (const chunk of response.data) {
@@ -216,13 +216,13 @@ async function processStreamBatch() {
                         }
                         try {
                             const errorJson = JSON.parse(errorData);
-                            return { error: errorJson };
+                            return { index, error: errorJson };
                         } catch (e) {
-                            return { error: errorData };
+                            return { index, error: errorData };
                         }
                     }
 
-                    return response.data;
+                    return { index, data: response.data };
                 } catch (error) {
                     if (error.response) {
                         let errorData = '';
@@ -237,112 +237,120 @@ async function processStreamBatch() {
                                 errorData = JSON.stringify(error.response.data);
                             }
                         }
-                        return { error: errorData || error.message };
+                        return { index, error: errorData || error.message };
                     } else if (error.request) {
-                        return { error: 'No response received from server' };
+                        return { index, error: 'No response received from server' };
                     } else {
-                        return { error: error.message };
+                        return { index, error: error.message };
                     }
                 }
             })
         );
 
-        responses.forEach((response, index) => {
-            const { res } = batch[index];
-            let isEnded = false;
+        // Handle all responses in parallel
+        await Promise.all(
+            responses.map(({ index, data, error }) => {
+                const { res } = batch[index];
+                let isEnded = false;
 
-            // Set SSE headers
-            res.setHeader('Content-Type', 'text/event-stream');
-            res.setHeader('Cache-Control', 'no-cache');
-            res.setHeader('Connection', 'keep-alive');
+                // Set SSE headers
+                res.setHeader('Content-Type', 'text/event-stream');
+                res.setHeader('Cache-Control', 'no-cache');
+                res.setHeader('Connection', 'keep-alive');
 
-            if (response.error) {
-                if (!isEnded) {
-                    const errorMessage = typeof response.error === 'string' 
-                        ? response.error 
-                        : JSON.stringify(response.error);
-                    res.write(`data: ${JSON.stringify({ error: errorMessage })}\n\n`);
-                    res.end();
-                    isEnded = true;
+                if (error) {
+                    if (!isEnded) {
+                        const errorMessage = typeof error === 'string' ? error : JSON.stringify(error);
+                        res.write(`data: ${JSON.stringify({ error: errorMessage })}\n\n`);
+                        res.end();
+                        isEnded = true;
+                    }
+                    return Promise.resolve();
                 }
-                return;
-            }
 
-            // Handle stream data
-            let buffer = '';
-            response.on('data', (chunk) => {
-                if (isEnded) return;
-                
-                buffer += chunk.toString();
-                const lines = buffer.split('\n');
-                buffer = lines.pop() || ''; // Keep the last incomplete line in buffer
+                return new Promise((resolve) => {
+                    let buffer = '';
+                    data.on('data', (chunk) => {
+                        if (isEnded) return;
+                        
+                        buffer += chunk.toString();
+                        const lines = buffer.split('\n');
+                        buffer = lines.pop() || '';
 
-                lines.forEach(line => {
-                    if (line.trim() === '') return;
-                    if (line.startsWith('data: ')) {
-                        const data = line.slice(6);
-                        if (data === '[DONE]') {
-                            if (!isEnded) {
-                                res.write('data: [DONE]\n\n');
-                                res.end();
-                                isEnded = true;
+                        lines.forEach(line => {
+                            if (line.trim() === '') return;
+                            if (line.startsWith('data: ')) {
+                                const data = line.slice(6);
+                                if (data === '[DONE]') {
+                                    if (!isEnded) {
+                                        res.write('data: [DONE]\n\n');
+                                        res.end();
+                                        isEnded = true;
+                                        resolve();
+                                    }
+                                } else {
+                                    try {
+                                        const parsed = JSON.parse(data);
+                                        if (!isEnded) {
+                                            res.write(`data: ${JSON.stringify(parsed)}\n\n`);
+                                        }
+                                    } catch (e) {
+                                        console.error('Error parsing stream data:', e);
+                                    }
+                                }
                             }
-                        } else {
+                        });
+                    });
+
+                    data.on('end', () => {
+                        if (isEnded) return;
+                        
+                        if (buffer.trim()) {
                             try {
+                                const data = buffer.slice(6);
                                 const parsed = JSON.parse(data);
                                 if (!isEnded) {
                                     res.write(`data: ${JSON.stringify(parsed)}\n\n`);
                                 }
                             } catch (e) {
-                                console.error('Error parsing stream data:', e);
+                                console.error('Error parsing final buffer:', e);
                             }
                         }
-                    }
-                });
-            });
-
-            response.on('end', () => {
-                if (isEnded) return;
-                
-                if (buffer.trim()) {
-                    try {
-                        const data = buffer.slice(6);
-                        const parsed = JSON.parse(data);
                         if (!isEnded) {
-                            res.write(`data: ${JSON.stringify(parsed)}\n\n`);
+                            res.write('data: [DONE]\n\n');
+                            res.end();
+                            isEnded = true;
                         }
-                    } catch (e) {
-                        console.error('Error parsing final buffer:', e);
-                    }
-                }
-                if (!isEnded) {
-                    res.write('data: [DONE]\n\n');
-                    res.end();
-                    isEnded = true;
-                }
-            });
+                        resolve();
+                    });
 
-            response.on('error', (error) => {
-                if (!isEnded) {
-                    res.write(`data: ${JSON.stringify({ error: error.message })}\n\n`);
-                    res.end();
-                    isEnded = true;
-                }
-            });
+                    data.on('error', (error) => {
+                        if (!isEnded) {
+                            res.write(`data: ${JSON.stringify({ error: error.message })}\n\n`);
+                            res.end();
+                            isEnded = true;
+                        }
+                        resolve();
+                    });
 
-            // Handle client disconnect
-            res.on('close', () => {
-                isEnded = true;
-            });
-        });
+                    res.on('close', () => {
+                        isEnded = true;
+                        resolve();
+                    });
+                });
+            })
+        );
     } catch (error) {
-        batch.forEach(req => {
-            if (!req.res.writableEnded) {
-                const errorMessage = error.response?.data || error.message;
-                req.res.write(`data: ${JSON.stringify({ error: errorMessage })}\n\n`);
-                req.res.end();
-            }
-        });
+        // Handle any errors in parallel
+        await Promise.all(
+            batch.map(req => {
+                if (!req.res.writableEnded) {
+                    const errorMessage = error.response?.data || error.message;
+                    req.res.write(`data: ${JSON.stringify({ error: errorMessage })}\n\n`);
+                    req.res.end();
+                }
+            })
+        );
     } finally {
         isStreamProcessing = false;
         // Process next batch if there are remaining requests
