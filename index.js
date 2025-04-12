@@ -11,9 +11,9 @@ const port = process.env.PORT || 3000;
 // Configuration
 const VLLM_ENDPOINT = `${process.env.VLLM_ENDPOINT || 'http://localhost:8080'}/v1/chat/completions`;
 const MODEL = process.env.MODEL || 'nvidia/Llama-3.1-Nemotron-Nano-8B-v1';
-const BATCH_INTERVAL = process.env.BATCH_INTERVAL || 100; // milliseconds
 const MAX_CONTEXT_LENGTH = process.env.MAX_CONTEXT_LENGTH || 8192; // Maximum context length for the model
-const DEFAULT_MAX_TOKENS = 1024; // Default max tokens for completion
+const DEFAULT_MAX_TOKENS = 512; // Default max tokens for completion
+const BATCH_SIZE = 50; // Number of requests to process in each batch
 
 // Request queues
 let requestQueue = [];
@@ -105,8 +105,8 @@ async function processBatch() {
     if (requestQueue.length === 0 || isProcessing) return;
 
     isProcessing = true;
-    // Take only first 50 requests
-    const batch = requestQueue.splice(0, 50);
+    // Take only first BATCH_SIZE requests
+    const batch = requestQueue.splice(0, BATCH_SIZE);
     // The remaining requests will stay in the queue for next processing
 
     try {
@@ -158,6 +158,10 @@ async function processBatch() {
         });
     } finally {
         isProcessing = false;
+        // Process next batch if there are remaining requests
+        if (requestQueue.length > 0) {
+            processBatch();
+        }
     }
 }
 
@@ -166,8 +170,8 @@ async function processStreamBatch() {
     if (streamRequestQueue.length === 0 || isStreamProcessing) return;
 
     isStreamProcessing = true;
-    // Take only first 50 requests
-    const batch = streamRequestQueue.splice(0, 50);
+    // Take only first BATCH_SIZE requests
+    const batch = streamRequestQueue.splice(0, BATCH_SIZE);
     // The remaining requests will stay in the queue for next processing
 
     try {
@@ -221,14 +225,11 @@ async function processStreamBatch() {
                     return response.data;
                 } catch (error) {
                     if (error.response) {
-                        // The request was made and the server responded with a status code
-                        // that falls out of the range of 2xx
                         let errorData = '';
                         if (error.response.data) {
                             if (typeof error.response.data === 'string') {
                                 errorData = error.response.data;
                             } else if (error.response.data.on) {
-                                // Handle stream
                                 for await (const chunk of error.response.data) {
                                     errorData += chunk.toString();
                                 }
@@ -238,10 +239,8 @@ async function processStreamBatch() {
                         }
                         return { error: errorData || error.message };
                     } else if (error.request) {
-                        // The request was made but no response was received
                         return { error: 'No response received from server' };
                     } else {
-                        // Something happened in setting up the request that triggered an Error
                         return { error: error.message };
                     }
                 }
@@ -346,19 +345,22 @@ async function processStreamBatch() {
         });
     } finally {
         isStreamProcessing = false;
+        // Process next batch if there are remaining requests
+        if (streamRequestQueue.length > 0) {
+            processStreamBatch();
+        }
     }
 }
-
-// Start batch processing intervals
-setInterval(processBatch, BATCH_INTERVAL);
-setInterval(processStreamBatch, BATCH_INTERVAL);
 
 // OpenAI-compatible endpoint
 app.post('/v1/chat/completions', async (req, res) => {
     try {
         if (req.body.stream) {
-            // Add to stream queue
+            // Add to stream queue and process if not already processing
             streamRequestQueue.push({ body: req.body, res });
+            if (!isStreamProcessing) {
+                processStreamBatch();
+            }
         } else {
             // Non-streaming request - wait for the response before sending
             const response = await new Promise((resolve, reject) => {
@@ -367,6 +369,10 @@ app.post('/v1/chat/completions', async (req, res) => {
                     resolve,
                     reject
                 });
+                // Process if not already processing
+                if (!isProcessing) {
+                    processBatch();
+                }
             });
             
             // Only send response after getting the VLLM response
