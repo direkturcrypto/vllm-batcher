@@ -197,11 +197,53 @@ async function processStreamBatch() {
         const responses = await Promise.all(
             requests.map(async (r, index) => {
                 try {
-                    const response = await axios.post(VLLM_ENDPOINT, r, { responseType: 'stream' });
+                    const response = await axios.post(VLLM_ENDPOINT, r, { 
+                        responseType: 'stream',
+                        validateStatus: function (status) {
+                            return status >= 200 && status < 500; // Accept all status codes less than 500
+                        }
+                    });
+
+                    // Check if response is an error
+                    if (response.status >= 400) {
+                        let errorData = '';
+                        for await (const chunk of response.data) {
+                            errorData += chunk.toString();
+                        }
+                        try {
+                            const errorJson = JSON.parse(errorData);
+                            return { error: errorJson };
+                        } catch (e) {
+                            return { error: errorData };
+                        }
+                    }
+
                     return response.data;
                 } catch (error) {
-                    console.error(`Error in streaming request ${index}:`, error.response?.data || error.message);
-                    return { error: error.response?.data || error.message };
+                    if (error.response) {
+                        // The request was made and the server responded with a status code
+                        // that falls out of the range of 2xx
+                        let errorData = '';
+                        if (error.response.data) {
+                            if (typeof error.response.data === 'string') {
+                                errorData = error.response.data;
+                            } else if (error.response.data.on) {
+                                // Handle stream
+                                for await (const chunk of error.response.data) {
+                                    errorData += chunk.toString();
+                                }
+                            } else {
+                                errorData = JSON.stringify(error.response.data);
+                            }
+                        }
+                        return { error: errorData || error.message };
+                    } else if (error.request) {
+                        // The request was made but no response was received
+                        return { error: 'No response received from server' };
+                    } else {
+                        // Something happened in setting up the request that triggered an Error
+                        return { error: error.message };
+                    }
                 }
             })
         );
@@ -217,7 +259,10 @@ async function processStreamBatch() {
 
             if (response.error) {
                 if (!isEnded) {
-                    res.write(`data: ${JSON.stringify({ error: response.error })}\n\n`);
+                    const errorMessage = typeof response.error === 'string' 
+                        ? response.error 
+                        : JSON.stringify(response.error);
+                    res.write(`data: ${JSON.stringify({ error: errorMessage })}\n\n`);
                     res.end();
                     isEnded = true;
                 }
@@ -294,7 +339,8 @@ async function processStreamBatch() {
     } catch (error) {
         batch.forEach(req => {
             if (!req.res.writableEnded) {
-                req.res.write(`data: ${JSON.stringify({ error: error.response?.data || error.message })}\n\n`);
+                const errorMessage = error.response?.data || error.message;
+                req.res.write(`data: ${JSON.stringify({ error: errorMessage })}\n\n`);
                 req.res.end();
             }
         });
