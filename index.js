@@ -122,9 +122,9 @@ setInterval(checkVLLMStatus, VLLM_STATUS_CHECK_INTERVAL);
 
 // Function to process non-streaming batch
 async function processBatch() {
-    if (requestQueue.length === 0 || isProcessing || !isVLLMAvailable || activeRequests >= MAX_CONCURRENT_REQUESTS) return;
+    if (requestQueue.length === 0 || !isVLLMAvailable || activeRequests >= MAX_CONCURRENT_REQUESTS) return;
 
-    isProcessing = true;
+    // isProcessing = true;
     const batch = requestQueue.splice(0, BATCH_SIZE);
 
     try {
@@ -182,7 +182,7 @@ async function processBatch() {
             batch.map(req => req.reject(error.response?.data || error.message))
         );
     } finally {
-        isProcessing = false;
+        // isProcessing = false;
         // Process next batch immediately if there are more requests
         if (requestQueue.length > 0) {
             processBatch();
