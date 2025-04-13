@@ -192,9 +192,9 @@ async function processBatch() {
 
 // Function to process streaming batch
 async function processStreamBatch() {
-    if (streamRequestQueue.length === 0 || isStreamProcessing || !isVLLMAvailable || activeRequests >= MAX_CONCURRENT_REQUESTS) return;
+    if (streamRequestQueue.length === 0 || !isVLLMAvailable || activeRequests >= MAX_CONCURRENT_REQUESTS) return;
 
-    isStreamProcessing = true;
+    // isStreamProcessing = true;
     const batch = streamRequestQueue.splice(0, BATCH_SIZE);
 
     try {
@@ -375,7 +375,7 @@ async function processStreamBatch() {
             })
         );
     } finally {
-        isStreamProcessing = false;
+        // isStreamProcessing = false;
         // Process next batch immediately if there are more requests
         if (streamRequestQueue.length > 0) {
             processStreamBatch();
