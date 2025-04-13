@@ -10,7 +10,7 @@ const port = process.env.PORT || 3000;
 
 // Configuration
 const VLLM_ENDPOINT = `${process.env.VLLM_ENDPOINT || 'http://localhost:8080'}/v1/chat/completions`;
-const MODEL = process.env.MODEL || 'nvidia/Llama-3.1-Nemotron-Nano-8B-v1';
+const MODEL = process.env.MODEL || 'mlabonne/Meta-Llama-3.1-8B-Instruct-abliterated';
 const MAX_CONTEXT_LENGTH = process.env.MAX_CONTEXT_LENGTH || 8192; // Maximum context length for the model
 const DEFAULT_MAX_TOKENS = 512; // Default max tokens for completion
 const BATCH_SIZE = 100; // Increased batch size
