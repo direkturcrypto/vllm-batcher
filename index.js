@@ -13,10 +13,10 @@ const VLLM_ENDPOINT = `${process.env.VLLM_ENDPOINT || 'http://localhost:8080'}/v
 const MODEL = process.env.MODEL || 'nvidia/Llama-3.1-Nemotron-Nano-8B-v1';
 const MAX_CONTEXT_LENGTH = process.env.MAX_CONTEXT_LENGTH || 8192; // Maximum context length for the model
 const DEFAULT_MAX_TOKENS = 512; // Default max tokens for completion
-const BATCH_SIZE = 50; // Number of requests to process in each batch
-const BATCH_INTERVAL = 500; // Process batch every 500ms
+const BATCH_SIZE = 100; // Increased batch size
+const BATCH_INTERVAL = 100; // Reduced interval to 100ms
 const MAX_QUEUE_SIZE = 1000; // Maximum number of requests in queue
-const MAX_CONCURRENT_REQUESTS = 200; // Maximum number of concurrent requests to VLLM
+const MAX_CONCURRENT_REQUESTS = 500; // Increased concurrent requests
 const VLLM_STATUS_CHECK_INTERVAL = 5000; // Check VLLM status every 5 seconds
 
 // Request queues and status
@@ -153,7 +153,7 @@ async function processBatch() {
 
         activeRequests += requests.length;
 
-        // Send all requests in parallel
+        // Send all requests in parallel with immediate processing
         const responses = await Promise.all(
             requests.map(async (r, index) => {
                 try {
@@ -183,6 +183,10 @@ async function processBatch() {
         );
     } finally {
         isProcessing = false;
+        // Process next batch immediately if there are more requests
+        if (requestQueue.length > 0) {
+            processBatch();
+        }
     }
 }
 
@@ -219,7 +223,7 @@ async function processStreamBatch() {
 
         activeRequests += requests.length;
 
-        // Send all requests in parallel
+        // Send all requests in parallel with immediate processing
         const responses = await Promise.all(
             requests.map(async (r, index) => {
                 try {
@@ -372,6 +376,10 @@ async function processStreamBatch() {
         );
     } finally {
         isStreamProcessing = false;
+        // Process next batch immediately if there are more requests
+        if (streamRequestQueue.length > 0) {
+            processStreamBatch();
+        }
     }
 }
 
