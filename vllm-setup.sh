@@ -1,6 +1,6 @@
 #!/bin/bash
 
-MODEL_REPO="nvidia/Llama-3.1-Nemotron-Nano-8B-v1"
+MODEL_REPO="unsloth/Llama-3.1-8B-Instruct-bnb-4bit"
 ALIAS_NAME="llama3.1-8b"
 VENV_DIR="vllm_env"
 PORT=8080
@@ -39,6 +39,10 @@ EOF
     --model $MODEL_REPO \
     --host 0.0.0.0 \
     --port $PORT \
+    --dtype auto \
+    --enable-prefix-caching \
+    --disable-log-requests \
+    --max-num-seqs 100 \
     --gpu-memory-utilization 0.9 \
     --max-model-len 8192 \
     > "$LOGFILE" 2>&1 &

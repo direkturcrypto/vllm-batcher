@@ -10,14 +10,18 @@ const port = process.env.PORT || 3000;
 
 // Configuration
 const VLLM_ENDPOINT = `${process.env.VLLM_ENDPOINT || 'http://localhost:8080'}/v1/chat/completions`;
-const MODEL = process.env.MODEL || 'mlabonne/Meta-Llama-3.1-8B-Instruct-abliterated';
-const MAX_CONTEXT_LENGTH = process.env.MAX_CONTEXT_LENGTH || 8192; // Maximum context length for the model
-const DEFAULT_MAX_TOKENS = 512; // Default max tokens for completion
-const BATCH_SIZE = 100; // Increased batch size
-const BATCH_INTERVAL = 100; // Reduced interval to 100ms
-const MAX_QUEUE_SIZE = 1000; // Maximum number of requests in queue
-const MAX_CONCURRENT_REQUESTS = 500; // Increased concurrent requests
-const VLLM_STATUS_CHECK_INTERVAL = 5000; // Check VLLM status every 5 seconds
+const MODEL = process.env.MODEL || 'unsloth/Llama-3.1-8B-Instruct-bnb-4bit';
+const MAX_CONTEXT_LENGTH = process.env.MAX_CONTEXT_LENGTH || 8192;
+const DEFAULT_MAX_TOKENS = 1024;
+const BATCH_SIZE = 100;
+const BATCH_INTERVAL = 100;
+const MAX_QUEUE_SIZE = 1000;
+const MAX_CONCURRENT_REQUESTS = 500;
+const VLLM_STATUS_CHECK_INTERVAL = 10000;
+const MAX_BATCH_TOKENS = process.env.MAX_BATCH_TOKENS || 100000; // Maximum tokens per batch
+const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY;
+const OPENROUTER_MODEL = process.env.OPENROUTER_MODEL || 'meta-llama/llama-3.1-8b-instruct';
+const OPENROUTER_ENDPOINT = process.env.OPENROUTER_ENDPOINT || 'https://openrouter.ai/api/v1/chat/completions';
 
 // Request queues and status
 let requestQueue = [];
@@ -26,6 +30,7 @@ let isProcessing = false;
 let isStreamProcessing = false;
 let activeRequests = 0;
 let isVLLMAvailable = true;
+let currentBatchTokens = 0;
 
 // Middleware
 app.use(bodyParser.json());
@@ -106,6 +111,21 @@ function normalizeMessages(messages) {
     return finalMessages;
 }
 
+// Function to estimate tokens in a message
+function estimateTokens(messages) {
+    if (!messages || !Array.isArray(messages)) return 0;
+    
+    // Simple estimation: ~4 chars per token for English text
+    let totalChars = 0;
+    for (const msg of messages) {
+        if (msg.content) {
+            totalChars += msg.content.length;
+        }
+    }
+    
+    return Math.ceil(totalChars / 4);
+}
+
 // Function to check VLLM server status
 async function checkVLLMStatus() {
     try {
@@ -117,15 +137,229 @@ async function checkVLLMStatus() {
     }
 }
 
+// Function to normalize non-streaming response
+function normalizeResponse(response, source = 'vllm') {
+    if (!response) return null;
+
+    // Return if it's already an error object
+    if (response.error) return response;
+
+    // Create a standard response format
+    const normalizedResponse = {
+        id: `chatcmpl-${Date.now()}-${Math.random().toString(36).substring(2, 10)}`,
+        object: 'chat.completion',
+        created: response.created || Math.floor(Date.now() / 1000),
+        model: response.model || (source === 'vllm' ? MODEL : OPENROUTER_MODEL),
+        choices: [],
+        usage: response.usage || {
+            prompt_tokens: 0,
+            completion_tokens: 0,
+            total_tokens: 0
+        }
+    };
+
+    // Normalize choices
+    if (response.choices && Array.isArray(response.choices)) {
+        normalizedResponse.choices = response.choices.map(choice => {
+            const normalizedChoice = {
+                index: choice.index || 0,
+                finish_reason: choice.finish_reason || 'stop'
+            };
+
+            // Handle different message formats
+            if (choice.message) {
+                normalizedChoice.message = {
+                    role: choice.message.role || 'assistant',
+                    content: choice.message.content || ''
+                };
+            } else if (choice.delta) {
+                normalizedChoice.delta = {
+                    role: choice.delta.role || 'assistant',
+                    content: choice.delta.content || ''
+                };
+            } else if (typeof choice.text === 'string') {
+                // Some models return just text
+                normalizedChoice.message = {
+                    role: 'assistant',
+                    content: choice.text
+                };
+            }
+
+            return normalizedChoice;
+        });
+    }
+
+    return normalizedResponse;
+}
+
+// Function to normalize streaming chunk
+function normalizeStreamChunk(chunk, source = 'vllm') {
+    if (!chunk) return null;
+
+    // If it's a string "[DONE]", return as is
+    if (chunk === '[DONE]') return chunk;
+
+    // If it's already an error object
+    if (chunk.error) return chunk;
+
+    try {
+        // Parse chunk if it's a string
+        const data = typeof chunk === 'string' ? JSON.parse(chunk) : chunk;
+
+        // Create normalized chunk
+        const normalizedChunk = {
+            id: `chatcmpl-${Date.now()}-${Math.random().toString(36).substring(2, 10)}`,
+            object: 'chat.completion.chunk',
+            created: data.created || Math.floor(Date.now() / 1000),
+            model: data.model || (source === 'vllm' ? MODEL : OPENROUTER_MODEL),
+            choices: []
+        };
+
+        // Normalize choices
+        if (data.choices && Array.isArray(data.choices)) {
+            normalizedChunk.choices = data.choices.map(choice => {
+                const normalizedChoice = {
+                    index: choice.index || 0,
+                    finish_reason: choice.finish_reason || null
+                };
+
+                // Handle different delta formats
+                if (choice.delta) {
+                    normalizedChoice.delta = {
+                        role: choice.delta.role || undefined,
+                        content: choice.delta.content || ''
+                    };
+                    
+                    // Remove undefined fields
+                    if (normalizedChoice.delta.role === undefined) {
+                        delete normalizedChoice.delta.role;
+                    }
+                } else if (choice.message) {
+                    normalizedChoice.delta = {
+                        role: choice.message.role || 'assistant',
+                        content: choice.message.content || ''
+                    };
+                } else if (typeof choice.text === 'string') {
+                    normalizedChoice.delta = {
+                        content: choice.text
+                    };
+                }
+
+                return normalizedChoice;
+            });
+        }
+
+        return normalizedChunk;
+    } catch (error) {
+        console.error('Error normalizing stream chunk:', error);
+        return chunk; // Return original on error
+    }
+}
+
+// Function to normalize error responses
+function normalizeErrorResponse(error) {
+    return {
+        error: {
+            message: typeof error === 'string' ? error : (error.message || 'Unknown error'),
+            type: error.type || 'server_error',
+            param: error.param,
+            code: error.code
+        }
+    };
+}
+
+// Forward request to OpenRouter
+async function forwardToOpenRouter(req, isStream = false) {
+    try {
+        const openRouterReq = {
+            model: OPENROUTER_MODEL,
+            messages: req.body.messages,
+            stream: isStream,
+            max_tokens: req.body.max_tokens || DEFAULT_MAX_TOKENS,
+            temperature: req.body.temperature || 0.7,
+            top_p: req.body.top_p || 1.0,
+            n: req.body.n || 1,
+            stop: req.body.stop,
+            presence_penalty: req.body.presence_penalty || 0.0,
+            frequency_penalty: req.body.frequency_penalty || 0.0,
+            logit_bias: req.body.logit_bias,
+            user: req.body.user
+        };
+
+        if (isStream) {
+            // Handle streaming response
+            const response = await axios.post(OPENROUTER_ENDPOINT, openRouterReq, {
+                headers: {
+                    'Authorization': `Bearer ${OPENROUTER_API_KEY}`,
+                    'X-Title': 'vLLM Batcher'
+                },
+                responseType: 'stream'
+            });
+            
+            return response.data;
+        } else {
+            // Handle non-streaming response
+            const response = await axios.post(OPENROUTER_ENDPOINT, openRouterReq, {
+                headers: {
+                    'Authorization': `Bearer ${OPENROUTER_API_KEY}`,
+                    'X-Title': 'vLLM Batcher'
+                }
+            });
+            
+            return normalizeResponse(response.data, 'openrouter');
+        }
+    } catch (error) {
+        console.error('Error forwarding to OpenRouter:', error.message);
+        // Create a standardized error object
+        const errorResponse = {
+            error: {
+                message: error.response?.data?.error?.message || error.message || 'OpenRouter error',
+                type: 'openrouter_error',
+                code: error.response?.status || 500
+            }
+        };
+        throw errorResponse; // Throw the standardized error
+    }
+}
+
 // Start VLLM status checking
 setInterval(checkVLLMStatus, VLLM_STATUS_CHECK_INTERVAL);
 
 // Function to process non-streaming batch
 async function processBatch() {
-    if (requestQueue.length === 0 || activeRequests >= MAX_CONCURRENT_REQUESTS) return;
+    if (requestQueue.length === 0 || !isVLLMAvailable || activeRequests >= MAX_CONCURRENT_REQUESTS) return;
 
-    // isProcessing = true;
-    const batch = requestQueue.splice(0, BATCH_SIZE);
+    // Reset token counter for new batch
+    currentBatchTokens = 0;
+    
+    // Take as many requests as possible until reaching MAX_BATCH_TOKENS
+    const batch = [];
+    while (requestQueue.length > 0 && batch.length < BATCH_SIZE) {
+        const req = requestQueue[0];
+        const estimatedTokens = estimateTokens(req.body.messages) + (req.body.max_tokens || DEFAULT_MAX_TOKENS);
+        
+        // If this single request exceeds context length, forward to OpenRouter
+        if (estimatedTokens > MAX_CONTEXT_LENGTH) {
+            const req = requestQueue.shift();
+            try {
+                const openRouterResponse = await forwardToOpenRouter(req);
+                req.resolve(openRouterResponse);
+            } catch (error) {
+                req.reject(error.response?.data || error.message);
+            }
+            continue;
+        }
+        
+        // If adding this request would exceed batch token limit, break
+        if (currentBatchTokens + estimatedTokens > MAX_BATCH_TOKENS) {
+            break;
+        }
+        
+        batch.push(requestQueue.shift());
+        currentBatchTokens += estimatedTokens;
+    }
+    
+    if (batch.length === 0) return;
 
     try {
         const requests = batch.map(req => {
@@ -158,9 +392,17 @@ async function processBatch() {
             requests.map(async (r, index) => {
                 try {
                     const response = await axios.post(VLLM_ENDPOINT, r);
-                    return { index, data: response.data };
+                    return { index, data: normalizeResponse(response.data, 'vllm') };
                 } catch (error) {
-                    return { index, error: error.response?.data || error.message };
+                    // Standardize error format
+                    const errorResponse = {
+                        error: {
+                            message: error.response?.data?.error?.message || error.message || 'VLLM processing error',
+                            type: 'vllm_error',
+                            code: error.response?.status || 500
+                        }
+                    };
+                    return { index, error: errorResponse };
                 } finally {
                     activeRequests--;
                 }
@@ -179,11 +421,20 @@ async function processBatch() {
         );
     } catch (error) {
         await Promise.all(
-            batch.map(req => req.reject(error.response?.data || error.message))
+            batch.map(req => {
+                // Standardize error format
+                const errorResponse = {
+                    error: {
+                        message: error.response?.data?.error?.message || error.message || 'Batch processing error',
+                        type: 'batch_error',
+                        code: error.response?.status || 500
+                    }
+                };
+                req.reject(errorResponse);
+            })
         );
     } finally {
-        // isProcessing = false;
-        // Process next batch immediately if there are more requests
+        // Process next batch immediately if there are remaining requests
         if (requestQueue.length > 0) {
             processBatch();
         }
@@ -192,10 +443,101 @@ async function processBatch() {
 
 // Function to process streaming batch
 async function processStreamBatch() {
-    if (streamRequestQueue.length === 0 || activeRequests >= MAX_CONCURRENT_REQUESTS) return;
+    if (streamRequestQueue.length === 0 || !isVLLMAvailable || activeRequests >= MAX_CONCURRENT_REQUESTS) return;
 
-    // isStreamProcessing = true;
-    const batch = streamRequestQueue.splice(0, BATCH_SIZE);
+    // Reset token counter for new batch
+    currentBatchTokens = 0;
+    
+    // Take as many requests as possible until reaching MAX_BATCH_TOKENS
+    const batch = [];
+    while (streamRequestQueue.length > 0 && batch.length < BATCH_SIZE) {
+        const req = streamRequestQueue[0];
+        const estimatedTokens = estimateTokens(req.body.messages) + (req.body.max_tokens || DEFAULT_MAX_TOKENS);
+        
+        // If this single request exceeds context length, forward to OpenRouter
+        if (estimatedTokens > MAX_CONTEXT_LENGTH) {
+            const req = streamRequestQueue.shift();
+            try {
+                const openRouterStream = await forwardToOpenRouter(req, true);
+                const { res } = req;
+                let isEnded = false;
+                
+                res.setHeader('Content-Type', 'text/event-stream');
+                res.setHeader('Cache-Control', 'no-cache');
+                res.setHeader('Connection', 'keep-alive');
+                
+                let buffer = '';
+                openRouterStream.on('data', (chunk) => {
+                    if (isEnded) return;
+                    
+                    buffer += chunk.toString();
+                    const lines = buffer.split('\n');
+                    buffer = lines.pop() || '';
+                    
+                    lines.forEach(line => {
+                        if (line.trim() === '') return;
+                        if (line.startsWith('data: ')) {
+                            const data = line.slice(6);
+                            if (data === '[DONE]') {
+                                if (!isEnded) {
+                                    res.write('data: [DONE]\n\n');
+                                    res.end();
+                                    isEnded = true;
+                                }
+                            } else {
+                                try {
+                                    const parsed = JSON.parse(data);
+                                    const normalized = normalizeStreamChunk(parsed, 'openrouter');
+                                    if (!isEnded) {
+                                        res.write(`data: ${JSON.stringify(normalized)}\n\n`);
+                                    }
+                                } catch (e) {
+                                    console.error('Error parsing stream data:', e);
+                                }
+                            }
+                        }
+                    });
+                });
+                
+                openRouterStream.on('end', () => {
+                    if (!isEnded) {
+                        res.write('data: [DONE]\n\n');
+                        res.end();
+                        isEnded = true;
+                    }
+                });
+                
+                openRouterStream.on('error', (error) => {
+                    if (!isEnded) {
+                        res.write(`data: ${JSON.stringify({ error: error.message })}\n\n`);
+                        res.end();
+                        isEnded = true;
+                    }
+                });
+                
+                res.on('close', () => {
+                    isEnded = true;
+                });
+            } catch (error) {
+                const { res } = req;
+                if (!res.writableEnded) {
+                    res.write(`data: ${JSON.stringify({ error: error.message })}\n\n`);
+                    res.end();
+                }
+            }
+            continue;
+        }
+        
+        // If adding this request would exceed batch token limit, break
+        if (currentBatchTokens + estimatedTokens > MAX_BATCH_TOKENS) {
+            break;
+        }
+        
+        batch.push(streamRequestQueue.shift());
+        currentBatchTokens += estimatedTokens;
+    }
+    
+    if (batch.length === 0) return;
 
     try {
         const requests = batch.map(req => {
@@ -284,8 +626,14 @@ async function processStreamBatch() {
 
                 if (error) {
                     if (!isEnded) {
-                        const errorMessage = typeof error === 'string' ? error : JSON.stringify(error);
-                        res.write(`data: ${JSON.stringify({ error: errorMessage })}\n\n`);
+                        // Standardize error format
+                        const errorResponse = {
+                            error: {
+                                message: typeof error === 'string' ? error : JSON.stringify(error),
+                                type: 'vllm_error'
+                            }
+                        };
+                        res.write(`data: ${JSON.stringify(errorResponse)}\n\n`);
                         res.end();
                         isEnded = true;
                     }
@@ -315,8 +663,9 @@ async function processStreamBatch() {
                                 } else {
                                     try {
                                         const parsed = JSON.parse(data);
+                                        const normalized = normalizeStreamChunk(parsed, 'vllm');
                                         if (!isEnded) {
-                                            res.write(`data: ${JSON.stringify(parsed)}\n\n`);
+                                            res.write(`data: ${JSON.stringify(normalized)}\n\n`);
                                         }
                                     } catch (e) {
                                         console.error('Error parsing stream data:', e);
@@ -333,8 +682,9 @@ async function processStreamBatch() {
                             try {
                                 const data = buffer.slice(6);
                                 const parsed = JSON.parse(data);
+                                const normalized = normalizeStreamChunk(parsed, 'vllm');
                                 if (!isEnded) {
-                                    res.write(`data: ${JSON.stringify(parsed)}\n\n`);
+                                    res.write(`data: ${JSON.stringify(normalized)}\n\n`);
                                 }
                             } catch (e) {
                                 console.error('Error parsing final buffer:', e);
@@ -350,7 +700,14 @@ async function processStreamBatch() {
 
                     data.on('error', (error) => {
                         if (!isEnded) {
-                            res.write(`data: ${JSON.stringify({ error: error.message })}\n\n`);
+                            // Standardize error format
+                            const errorResponse = {
+                                error: {
+                                    message: error.message || 'Stream error',
+                                    type: 'stream_error'
+                                }
+                            };
+                            res.write(`data: ${JSON.stringify(errorResponse)}\n\n`);
                             res.end();
                             isEnded = true;
                         }
@@ -368,14 +725,19 @@ async function processStreamBatch() {
         await Promise.all(
             batch.map(req => {
                 if (!req.res.writableEnded) {
-                    const errorMessage = error.response?.data || error.message;
-                    req.res.write(`data: ${JSON.stringify({ error: errorMessage })}\n\n`);
+                    // Standardize error format
+                    const errorResponse = {
+                        error: {
+                            message: error.response?.data || error.message,
+                            type: 'batch_processing_error'
+                        }
+                    };
+                    req.res.write(`data: ${JSON.stringify(errorResponse)}\n\n`);
                     req.res.end();
                 }
             })
         );
     } finally {
-        // isStreamProcessing = false;
         // Process next batch immediately if there are more requests
         if (streamRequestQueue.length > 0) {
             processStreamBatch();
@@ -386,8 +748,113 @@ async function processStreamBatch() {
 // OpenAI-compatible endpoint
 app.post('/v1/chat/completions', async (req, res) => {
     try {
+        // Check various conditions for OpenRouter fallback:
+        // 1. Queue size exceeds limit, or
+        // 2. Estimated tokens exceed context length, or
+        // 3. VLLM server is unavailable
+        const totalQueueSize = requestQueue.length + streamRequestQueue.length;
+        const estimatedTokens = estimateTokens(req.body.messages) + (req.body.max_tokens || DEFAULT_MAX_TOKENS);
+        
+        // Forward to OpenRouter if any fallback condition is met
+        if (totalQueueSize >= MAX_QUEUE_SIZE || estimatedTokens > MAX_CONTEXT_LENGTH || !isVLLMAvailable) {
+            console.log(`Forwarding to OpenRouter: ${!isVLLMAvailable ? 'VLLM unavailable' : (totalQueueSize >= MAX_QUEUE_SIZE ? 'Queue full' : 'Context length exceeded')}`);
+            
+            if (req.body.stream) {
+                try {
+                    const openRouterStream = await forwardToOpenRouter(req, true);
+                    
+                    res.setHeader('Content-Type', 'text/event-stream');
+                    res.setHeader('Cache-Control', 'no-cache');
+                    res.setHeader('Connection', 'keep-alive');
+                    
+                    let buffer = '';
+                    let isEnded = false;
+                    
+                    openRouterStream.on('data', (chunk) => {
+                        if (isEnded) return;
+                        
+                        buffer += chunk.toString();
+                        const lines = buffer.split('\n');
+                        buffer = lines.pop() || '';
+                        
+                        lines.forEach(line => {
+                            if (line.trim() === '') return;
+                            if (line.startsWith('data: ')) {
+                                const data = line.slice(6);
+                                if (data === '[DONE]') {
+                                    if (!isEnded) {
+                                        res.write('data: [DONE]\n\n');
+                                        res.end();
+                                        isEnded = true;
+                                    }
+                                } else {
+                                    try {
+                                        // Normalize the OpenRouter response to match standard OpenAI format
+                                        const parsed = JSON.parse(data);
+                                        const normalized = normalizeStreamChunk(parsed, 'openrouter');
+                                        if (!isEnded) {
+                                            res.write(`data: ${JSON.stringify(normalized)}\n\n`);
+                                        }
+                                    } catch (e) {
+                                        console.error('Error parsing OpenRouter stream data:', e);
+                                    }
+                                }
+                            }
+                        });
+                    });
+                    
+                    openRouterStream.on('end', () => {
+                        if (!isEnded) {
+                            res.write('data: [DONE]\n\n');
+                            res.end();
+                            isEnded = true;
+                        }
+                    });
+                    
+                    openRouterStream.on('error', (error) => {
+                        if (!isEnded) {
+                            res.write(`data: ${JSON.stringify({ error: error.message })}\n\n`);
+                            res.end();
+                            isEnded = true;
+                        }
+                    });
+                    
+                    res.on('close', () => {
+                        isEnded = true;
+                    });
+                } catch (error) {
+                    // Standardize error format
+                    const errorResponse = {
+                        error: {
+                            message: error.message || 'OpenRouter error',
+                            type: 'openrouter_error'
+                        }
+                    };
+                    res.write(`data: ${JSON.stringify(errorResponse)}\n\n`);
+                    res.end();
+                }
+            } else {
+                try {
+                    const openRouterResponse = await forwardToOpenRouter(req);
+                    res.json(openRouterResponse);
+                } catch (error) {
+                    // Standardize error format
+                    res.status(500).json({
+                        error: {
+                            message: error.response?.data || error.message,
+                            type: 'openrouter_error'
+                        }
+                    });
+                }
+            }
+            return;
+        }
+
         if (req.body.stream) {
             streamRequestQueue.push({ body: req.body, res });
+            if (streamRequestQueue.length === 1) {
+                processStreamBatch();
+            }
         } else {
             const response = await new Promise((resolve, reject) => {
                 requestQueue.push({
@@ -395,11 +862,17 @@ app.post('/v1/chat/completions', async (req, res) => {
                     resolve,
                     reject
                 });
+                
+                if (requestQueue.length === 1) {
+                    processBatch();
+                }
             });
+            
             res.json(response);
         }
     } catch (error) {
         if (!req.body.stream) {
+            // Standardize error format
             res.status(500).json({
                 error: {
                     message: error.response?.data || error.message,
