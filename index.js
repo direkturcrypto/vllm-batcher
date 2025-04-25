@@ -19,7 +19,6 @@ const MAX_QUEUE_SIZE = 1000;
 const MAX_CONCURRENT_REQUESTS = 500;
 const VLLM_STATUS_CHECK_INTERVAL = 10000;
 const MAX_BATCH_TOKENS = process.env.MAX_BATCH_TOKENS || 100000; // Maximum tokens per batch
-const MAX_VLLM_WAITING_REQUESTS = 5; // Maximum number of waiting requests for VLLM
 const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY;
 const OPENROUTER_MODEL = process.env.OPENROUTER_MODEL || 'meta-llama/llama-3.1-8b-instruct';
 const OPENROUTER_ENDPOINT = process.env.OPENROUTER_ENDPOINT || 'https://openrouter.ai/api/v1/chat/completions';
@@ -33,6 +32,12 @@ let activeRequests = 0;
 let isVLLMAvailable = true;
 let currentBatchTokens = 0;
 let vllmWaitingRequests = 0; // Current count of waiting requests in VLLM
+
+// Add variables that can be modified at runtime
+let RUNTIME_CONFIG = {
+    ENABLE_FALLBACK: process.env.ENABLE_FALLBACK !== 'false', // Default to true unless explicitly set to 'false'
+    MAX_VLLM_WAITING_REQUESTS: parseInt(process.env.MAX_VLLM_WAITING_REQUESTS || '5', 10)
+};
 
 // Middleware
 app.use(bodyParser.json());
@@ -356,7 +361,7 @@ async function forwardToOpenRouter(req, isStream = false) {
     }
 }
 
-// Add a logging function to track performance metrics
+// Update the logging function
 function logPerformanceMetrics() {
     if (vllmWaitingRequests > 0) {
         console.log(`=== PERFORMANCE METRICS ===`);
@@ -364,6 +369,8 @@ function logPerformanceMetrics() {
         console.log(`Queue Size: ${requestQueue.length + streamRequestQueue.length} (${requestQueue.length} non-stream, ${streamRequestQueue.length} stream)`);
         console.log(`VLLM Waiting Requests: ${vllmWaitingRequests}`);
         console.log(`VLLM Available: ${isVLLMAvailable}`);
+        console.log(`Fallback Enabled: ${RUNTIME_CONFIG.ENABLE_FALLBACK}`);
+        console.log(`Max VLLM Waiting Requests: ${RUNTIME_CONFIG.MAX_VLLM_WAITING_REQUESTS}`);
         console.log(`=========================`);
     }
 }
@@ -372,7 +379,22 @@ function logPerformanceMetrics() {
 setInterval(checkVLLMStatus, VLLM_STATUS_CHECK_INTERVAL);
 setInterval(logPerformanceMetrics, VLLM_STATUS_CHECK_INTERVAL);
 
-// Function to process non-streaming batch
+// Update the shouldUseFallback function
+function shouldUseFallback(condition) {
+    // If fallback is disabled, don't use it
+    if (!RUNTIME_CONFIG.ENABLE_FALLBACK) return false;
+    
+    // If OpenRouter API key is not provided, don't use fallback
+    if (!OPENROUTER_API_KEY) {
+        console.log('Fallback requested but OPENROUTER_API_KEY not provided');
+        return false;
+    }
+    
+    // Otherwise, base decision on the provided condition
+    return condition;
+}
+
+// Update processBatch function
 async function processBatch() {
     if (requestQueue.length === 0 || !isVLLMAvailable || activeRequests >= MAX_CONCURRENT_REQUESTS) return;
 
@@ -385,18 +407,32 @@ async function processBatch() {
         const req = requestQueue[0];
         const estimatedTokens = estimateTokens(req.body.messages) + (req.body.max_tokens || DEFAULT_MAX_TOKENS);
         
-        // If this single request exceeds context length or we have too many waiting requests, forward to OpenRouter
-        const tooManyWaitingRequests = vllmWaitingRequests >= MAX_VLLM_WAITING_REQUESTS;
-        if (estimatedTokens > MAX_CONTEXT_LENGTH || tooManyWaitingRequests) {
+        // Check if fallback should be used
+        const tooManyWaitingRequests = vllmWaitingRequests >= RUNTIME_CONFIG.MAX_VLLM_WAITING_REQUESTS;
+        const contextTooLarge = estimatedTokens > MAX_CONTEXT_LENGTH;
+        
+        if (shouldUseFallback(contextTooLarge || tooManyWaitingRequests)) {
             const req = requestQueue.shift();
             try {
-                const reason = estimatedTokens > MAX_CONTEXT_LENGTH ? 'Context length exceeded' : 'Too many waiting requests';
+                const reason = contextTooLarge ? 'Context length exceeded' : 'Too many waiting requests';
                 console.log(`Forwarding to OpenRouter from batch: ${reason}`);
                 const openRouterResponse = await forwardToOpenRouter(req);
                 req.resolve(openRouterResponse);
             } catch (error) {
                 req.reject(error.response?.data || error.message);
             }
+            continue;
+        }
+        
+        // If fallback is disabled but context is too large, reject the request
+        if (contextTooLarge) {
+            const req = requestQueue.shift();
+            req.reject({
+                error: {
+                    message: 'Request exceeds maximum context length and fallback is disabled',
+                    type: 'context_length_exceeded'
+                }
+            });
             continue;
         }
         
@@ -491,7 +527,7 @@ async function processBatch() {
     }
 }
 
-// Function to process streaming batch
+// Update processStreamBatch function
 async function processStreamBatch() {
     if (streamRequestQueue.length === 0 || !isVLLMAvailable || activeRequests >= MAX_CONCURRENT_REQUESTS) return;
 
@@ -504,12 +540,14 @@ async function processStreamBatch() {
         const req = streamRequestQueue[0];
         const estimatedTokens = estimateTokens(req.body.messages) + (req.body.max_tokens || DEFAULT_MAX_TOKENS);
         
-        // If this single request exceeds context length or we have too many waiting requests, forward to OpenRouter
-        const tooManyWaitingRequests = vllmWaitingRequests >= MAX_VLLM_WAITING_REQUESTS;
-        if (estimatedTokens > MAX_CONTEXT_LENGTH || tooManyWaitingRequests) {
+        // Check if fallback should be used
+        const tooManyWaitingRequests = vllmWaitingRequests >= RUNTIME_CONFIG.MAX_VLLM_WAITING_REQUESTS;
+        const contextTooLarge = estimatedTokens > MAX_CONTEXT_LENGTH;
+        
+        if (shouldUseFallback(contextTooLarge || tooManyWaitingRequests)) {
             const req = streamRequestQueue.shift();
             try {
-                const reason = estimatedTokens > MAX_CONTEXT_LENGTH ? 'Context length exceeded' : 'Too many waiting requests';
+                const reason = contextTooLarge ? 'Context length exceeded' : 'Too many waiting requests';
                 console.log(`Forwarding to OpenRouter from stream batch: ${reason}`);
                 const openRouterStream = await forwardToOpenRouter(req, true);
                 const { res } = req;
@@ -578,6 +616,24 @@ async function processStreamBatch() {
                     res.end();
                 }
             }
+            continue;
+        }
+        
+        // If fallback is disabled but context is too large, reject the request
+        if (contextTooLarge) {
+            const req = streamRequestQueue.shift();
+            const { res } = req;
+            res.setHeader('Content-Type', 'text/event-stream');
+            res.setHeader('Cache-Control', 'no-cache');
+            res.setHeader('Connection', 'keep-alive');
+            
+            res.write(`data: ${JSON.stringify({
+                error: {
+                    message: 'Request exceeds maximum context length and fallback is disabled',
+                    type: 'context_length_exceeded'
+                }
+            })}\n\n`);
+            res.end();
             continue;
         }
         
@@ -798,31 +854,25 @@ async function processStreamBatch() {
     }
 }
 
-// Update the OpenAI-compatible endpoint to increment activeRequests
+// Update the OpenAI-compatible endpoint
 app.post('/v1/chat/completions', async (req, res) => {
     try {
         // Increment activeRequests to track pending requests more accurately
         activeRequests++;
         
-        // Check various conditions for OpenRouter fallback:
-        // 1. Queue size exceeds limit, or
-        // 2. Estimated tokens exceed context length, or
-        // 3. VLLM server is unavailable, or
-        // 4. VLLM waiting requests exceed MAX_VLLM_WAITING_REQUESTS
+        // Check conditions for OpenRouter fallback
         const totalQueueSize = requestQueue.length + streamRequestQueue.length;
         const estimatedTokens = estimateTokens(req.body.messages) + (req.body.max_tokens || DEFAULT_MAX_TOKENS);
-        const tooManyWaitingRequests = vllmWaitingRequests >= MAX_VLLM_WAITING_REQUESTS;
+        const tooManyWaitingRequests = vllmWaitingRequests >= RUNTIME_CONFIG.MAX_VLLM_WAITING_REQUESTS;
+        const queueFull = totalQueueSize >= MAX_QUEUE_SIZE;
+        const contextTooLarge = estimatedTokens > MAX_CONTEXT_LENGTH;
         
-        // Forward to OpenRouter if any fallback condition is met
-        if (totalQueueSize >= MAX_QUEUE_SIZE || 
-            estimatedTokens > MAX_CONTEXT_LENGTH || 
-            !isVLLMAvailable || 
-            tooManyWaitingRequests) {
-            
+        // Check if fallback should be used
+        if (shouldUseFallback(queueFull || contextTooLarge || !isVLLMAvailable || tooManyWaitingRequests)) {
             const reason = !isVLLMAvailable ? 'VLLM unavailable' : 
-                           (totalQueueSize >= MAX_QUEUE_SIZE ? 'Queue full' : 
-                           (estimatedTokens > MAX_CONTEXT_LENGTH ? 'Context length exceeded' : 
-                           'Too many waiting requests'));
+                          (queueFull ? 'Queue full' : 
+                          (contextTooLarge ? 'Context length exceeded' : 
+                          'Too many waiting requests'));
             
             console.log(`Forwarding to OpenRouter: ${reason}`);
             
@@ -915,6 +965,29 @@ app.post('/v1/chat/completions', async (req, res) => {
                 }
             }
             return;
+        } else if (contextTooLarge) {
+            // If fallback is disabled but context is too large, reject the request
+            if (req.body.stream) {
+                res.setHeader('Content-Type', 'text/event-stream');
+                res.setHeader('Cache-Control', 'no-cache');
+                res.setHeader('Connection', 'keep-alive');
+                
+                res.write(`data: ${JSON.stringify({
+                    error: {
+                        message: 'Request exceeds maximum context length and fallback is disabled',
+                        type: 'context_length_exceeded'
+                    }
+                })}\n\n`);
+                res.end();
+            } else {
+                res.status(400).json({
+                    error: {
+                        message: 'Request exceeds maximum context length and fallback is disabled',
+                        type: 'context_length_exceeded'
+                    }
+                });
+            }
+            return;
         }
 
         if (req.body.stream) {
@@ -973,6 +1046,34 @@ app.get('/status', (req, res) => {
                 waitingRequests: vllmWaitingRequests
             }
         }
+    });
+});
+
+// Update the fallback status endpoint
+app.get('/fallback/status', (req, res) => {
+    res.json({
+        enabled: RUNTIME_CONFIG.ENABLE_FALLBACK,
+        openrouter_key_configured: !!OPENROUTER_API_KEY,
+        openrouter_model: OPENROUTER_MODEL,
+        max_waiting_requests: RUNTIME_CONFIG.MAX_VLLM_WAITING_REQUESTS
+    });
+});
+
+// Update the fallback toggle endpoint
+app.post('/fallback/toggle', (req, res) => {
+    const { enabled, max_waiting_requests } = req.body;
+    
+    if (enabled !== undefined && typeof enabled === 'boolean') {
+        RUNTIME_CONFIG.ENABLE_FALLBACK = enabled;
+    }
+    
+    if (max_waiting_requests !== undefined && Number.isInteger(max_waiting_requests) && max_waiting_requests >= 0) {
+        RUNTIME_CONFIG.MAX_VLLM_WAITING_REQUESTS = max_waiting_requests;
+    }
+    
+    res.json({
+        status: 'success',
+        config: RUNTIME_CONFIG
     });
 });
 
