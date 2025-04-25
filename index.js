@@ -19,6 +19,7 @@ const MAX_QUEUE_SIZE = 1000;
 const MAX_CONCURRENT_REQUESTS = 500;
 const VLLM_STATUS_CHECK_INTERVAL = 10000;
 const MAX_BATCH_TOKENS = process.env.MAX_BATCH_TOKENS || 100000; // Maximum tokens per batch
+const MAX_VLLM_WAITING_REQUESTS = 5; // Maximum number of waiting requests for VLLM
 const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY;
 const OPENROUTER_MODEL = process.env.OPENROUTER_MODEL || 'meta-llama/llama-3.1-8b-instruct';
 const OPENROUTER_ENDPOINT = process.env.OPENROUTER_ENDPOINT || 'https://openrouter.ai/api/v1/chat/completions';
@@ -31,6 +32,7 @@ let isStreamProcessing = false;
 let activeRequests = 0;
 let isVLLMAvailable = true;
 let currentBatchTokens = 0;
+let vllmWaitingRequests = 0; // Current count of waiting requests in VLLM
 
 // Middleware
 app.use(bodyParser.json());
@@ -126,11 +128,43 @@ function estimateTokens(messages) {
     return Math.ceil(totalChars / 4);
 }
 
-// Function to check VLLM server status
+// Function to check VLLM server status and queue length
 async function checkVLLMStatus() {
     try {
-        const response = await axios.get(VLLM_ENDPOINT.replace('/v1/chat/completions', '/health'));
-        isVLLMAvailable = response.status === 200;
+        // First check if the server is available at all
+        const healthResponse = await axios.get(VLLM_ENDPOINT.replace('/v1/chat/completions', '/health'));
+        
+        if (healthResponse.status === 200) {
+            isVLLMAvailable = true;
+            
+            // Try different methods to get queue statistics
+            let foundStats = false;
+            
+            try {
+                const metricsResponse = await axios.get(VLLM_ENDPOINT.replace('/v1/chat/completions', '/metrics'));
+                if (metricsResponse.data) {
+                    const waitingMatch = metricsResponse.data.toString().match(/waiting_requests\s+(\d+)/);
+                    if (waitingMatch && waitingMatch[1]) {
+                        vllmWaitingRequests = parseInt(waitingMatch[1], 10);
+                        if (vllmWaitingRequests > 0) {
+                            console.log(`VLLM waiting requests (from metrics): ${vllmWaitingRequests}`);
+                            foundStats = true;
+                        }
+                    }
+                }
+            } catch (metricsError) {
+                console.log('Could not fetch VLLM metrics:', metricsError.message);
+            }
+            
+            // Method 3: If all else fails, base it on our actively sent requests
+            if (!foundStats) {
+                // Use our active requests as a rough estimate
+                vllmWaitingRequests = Math.max(0, activeRequests - 5); // Assume at least 5 can be processed concurrently
+                // console.log(`VLLM waiting requests (estimated): ${vllmWaitingRequests}`);
+            }
+        } else {
+            isVLLMAvailable = false;
+        }
     } catch (error) {
         isVLLMAvailable = false;
         console.error('VLLM server is not available:', error.message);
@@ -322,8 +356,21 @@ async function forwardToOpenRouter(req, isStream = false) {
     }
 }
 
-// Start VLLM status checking
+// Add a logging function to track performance metrics
+function logPerformanceMetrics() {
+    if (vllmWaitingRequests > 0) {
+        console.log(`=== PERFORMANCE METRICS ===`);
+        console.log(`Active Requests: ${activeRequests}`);
+        console.log(`Queue Size: ${requestQueue.length + streamRequestQueue.length} (${requestQueue.length} non-stream, ${streamRequestQueue.length} stream)`);
+        console.log(`VLLM Waiting Requests: ${vllmWaitingRequests}`);
+        console.log(`VLLM Available: ${isVLLMAvailable}`);
+        console.log(`=========================`);
+    }
+}
+
+// Start VLLM status checking and metrics logging
 setInterval(checkVLLMStatus, VLLM_STATUS_CHECK_INTERVAL);
+setInterval(logPerformanceMetrics, VLLM_STATUS_CHECK_INTERVAL);
 
 // Function to process non-streaming batch
 async function processBatch() {
@@ -338,10 +385,13 @@ async function processBatch() {
         const req = requestQueue[0];
         const estimatedTokens = estimateTokens(req.body.messages) + (req.body.max_tokens || DEFAULT_MAX_TOKENS);
         
-        // If this single request exceeds context length, forward to OpenRouter
-        if (estimatedTokens > MAX_CONTEXT_LENGTH) {
+        // If this single request exceeds context length or we have too many waiting requests, forward to OpenRouter
+        const tooManyWaitingRequests = vllmWaitingRequests >= MAX_VLLM_WAITING_REQUESTS;
+        if (estimatedTokens > MAX_CONTEXT_LENGTH || tooManyWaitingRequests) {
             const req = requestQueue.shift();
             try {
+                const reason = estimatedTokens > MAX_CONTEXT_LENGTH ? 'Context length exceeded' : 'Too many waiting requests';
+                console.log(`Forwarding to OpenRouter from batch: ${reason}`);
                 const openRouterResponse = await forwardToOpenRouter(req);
                 req.resolve(openRouterResponse);
             } catch (error) {
@@ -454,10 +504,13 @@ async function processStreamBatch() {
         const req = streamRequestQueue[0];
         const estimatedTokens = estimateTokens(req.body.messages) + (req.body.max_tokens || DEFAULT_MAX_TOKENS);
         
-        // If this single request exceeds context length, forward to OpenRouter
-        if (estimatedTokens > MAX_CONTEXT_LENGTH) {
+        // If this single request exceeds context length or we have too many waiting requests, forward to OpenRouter
+        const tooManyWaitingRequests = vllmWaitingRequests >= MAX_VLLM_WAITING_REQUESTS;
+        if (estimatedTokens > MAX_CONTEXT_LENGTH || tooManyWaitingRequests) {
             const req = streamRequestQueue.shift();
             try {
+                const reason = estimatedTokens > MAX_CONTEXT_LENGTH ? 'Context length exceeded' : 'Too many waiting requests';
+                console.log(`Forwarding to OpenRouter from stream batch: ${reason}`);
                 const openRouterStream = await forwardToOpenRouter(req, true);
                 const { res } = req;
                 let isEnded = false;
@@ -745,19 +798,33 @@ async function processStreamBatch() {
     }
 }
 
-// OpenAI-compatible endpoint
+// Update the OpenAI-compatible endpoint to increment activeRequests
 app.post('/v1/chat/completions', async (req, res) => {
     try {
+        // Increment activeRequests to track pending requests more accurately
+        activeRequests++;
+        
         // Check various conditions for OpenRouter fallback:
         // 1. Queue size exceeds limit, or
         // 2. Estimated tokens exceed context length, or
-        // 3. VLLM server is unavailable
+        // 3. VLLM server is unavailable, or
+        // 4. VLLM waiting requests exceed MAX_VLLM_WAITING_REQUESTS
         const totalQueueSize = requestQueue.length + streamRequestQueue.length;
         const estimatedTokens = estimateTokens(req.body.messages) + (req.body.max_tokens || DEFAULT_MAX_TOKENS);
+        const tooManyWaitingRequests = vllmWaitingRequests >= MAX_VLLM_WAITING_REQUESTS;
         
         // Forward to OpenRouter if any fallback condition is met
-        if (totalQueueSize >= MAX_QUEUE_SIZE || estimatedTokens > MAX_CONTEXT_LENGTH || !isVLLMAvailable) {
-            console.log(`Forwarding to OpenRouter: ${!isVLLMAvailable ? 'VLLM unavailable' : (totalQueueSize >= MAX_QUEUE_SIZE ? 'Queue full' : 'Context length exceeded')}`);
+        if (totalQueueSize >= MAX_QUEUE_SIZE || 
+            estimatedTokens > MAX_CONTEXT_LENGTH || 
+            !isVLLMAvailable || 
+            tooManyWaitingRequests) {
+            
+            const reason = !isVLLMAvailable ? 'VLLM unavailable' : 
+                           (totalQueueSize >= MAX_QUEUE_SIZE ? 'Queue full' : 
+                           (estimatedTokens > MAX_CONTEXT_LENGTH ? 'Context length exceeded' : 
+                           'Too many waiting requests'));
+            
+            console.log(`Forwarding to OpenRouter: ${reason}`);
             
             if (req.body.stream) {
                 try {
@@ -880,12 +947,34 @@ app.post('/v1/chat/completions', async (req, res) => {
                 }
             });
         }
+    } finally {
+        // Ensure activeRequests is decremented when the request is fully processed
+        activeRequests--;
     }
 });
 
-// Start batch processing intervals
+// Start batch processing intervals - use separate intervals with faster timing for processing
 setInterval(processBatch, BATCH_INTERVAL);
 setInterval(processStreamBatch, BATCH_INTERVAL);
+
+// Add a route to get current server status
+app.get('/status', (req, res) => {
+    res.json({
+        status: 'ok',
+        metrics: {
+            activeRequests,
+            queueSize: {
+                total: requestQueue.length + streamRequestQueue.length,
+                nonStream: requestQueue.length,
+                stream: streamRequestQueue.length
+            },
+            vllm: {
+                available: isVLLMAvailable,
+                waitingRequests: vllmWaitingRequests
+            }
+        }
+    });
+});
 
 // Start the server
 app.listen(port, () => {
