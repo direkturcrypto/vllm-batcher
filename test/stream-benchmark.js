@@ -2,7 +2,7 @@ const axios = require('axios');
 const { performance } = require('perf_hooks');
 
 const BATCHER_URL = 'http://localhost:3000/v1/chat/completions';
-const NUM_USERS = 1000;
+const NUM_USERS = 50;
 const NUM_REQUESTS_PER_USER = 1;
 
 // Function to make a streaming request

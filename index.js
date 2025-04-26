@@ -394,7 +394,37 @@ function shouldUseFallback(condition) {
     return condition;
 }
 
-// Update processBatch function
+// Add a function to inject system message for VLLM requests only
+function injectSystemMessage(messages) {
+    if (!Array.isArray(messages)) return messages;
+    
+    const systemMessageContent = "You are a helpful llama assistant designed based on LLaMA 3.1-8B, specialized in high-quality answers.";
+    
+    // Check if there's already a system message
+    let hasSystemMessage = false;
+    
+    // First pass: modify existing system message if found
+    for (let i = 0; i < messages.length; i++) {
+        if (messages[i].role === 'system') {
+            hasSystemMessage = true;
+            // Append our content to the existing system message
+            messages[i].content = `${systemMessageContent}\n${messages[i].content}`;
+            break;
+        }
+    }
+    
+    // If no system message was found, add one at the beginning
+    if (!hasSystemMessage) {
+        messages = [
+            { role: 'system', content: systemMessageContent },
+            ...messages
+        ];
+    }
+    
+    return messages;
+}
+
+// Update processBatch function to use injectSystemMessage for VLLM requests
 async function processBatch() {
     if (requestQueue.length === 0 || !isVLLMAvailable || activeRequests >= MAX_CONCURRENT_REQUESTS) return;
 
@@ -450,7 +480,10 @@ async function processBatch() {
 
     try {
         const requests = batch.map(req => {
-            const normalizedMessages = normalizeMessages(req.body.messages);
+            // Inject system message for VLLM
+            const messagesWithSystem = injectSystemMessage([...req.body.messages]);
+            const normalizedMessages = normalizeMessages(messagesWithSystem);
+            
             const maxTokens = Math.min(
                 DEFAULT_MAX_TOKENS > req.body.max_tokens ? DEFAULT_MAX_TOKENS : req.body.max_tokens,
                 MAX_CONTEXT_LENGTH - 1000
@@ -462,9 +495,10 @@ async function processBatch() {
                 stream: false,
                 max_tokens: maxTokens,
                 temperature: req.body.temperature || 0.7,
-                top_p: req.body.top_p || 1.0,
+                top_p: req.body.top_p || 0.9,
                 n: req.body.n || 1,
                 stop: req.body.stop,
+                repeat_penalty: 1.1,
                 presence_penalty: req.body.presence_penalty || 0.0,
                 frequency_penalty: req.body.frequency_penalty || 0.0,
                 logit_bias: req.body.logit_bias,
@@ -528,7 +562,7 @@ async function processBatch() {
     }
 }
 
-// Update processStreamBatch function
+// Update processStreamBatch function to use injectSystemMessage for VLLM requests
 async function processStreamBatch() {
     if (streamRequestQueue.length === 0 || !isVLLMAvailable || activeRequests >= MAX_CONCURRENT_REQUESTS) return;
 
@@ -654,7 +688,10 @@ async function processStreamBatch() {
 
     try {
         const requests = batch.map(req => {
-            const normalizedMessages = normalizeMessages(req.body.messages);
+            // Inject system message for VLLM
+            const messagesWithSystem = injectSystemMessage([...req.body.messages]);
+            const normalizedMessages = normalizeMessages(messagesWithSystem);
+            
             const maxTokens = Math.min(
                 DEFAULT_MAX_TOKENS > req.body.max_tokens ? DEFAULT_MAX_TOKENS : req.body.max_tokens,
                 MAX_CONTEXT_LENGTH - 1000
