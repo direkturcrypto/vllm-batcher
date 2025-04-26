@@ -11,7 +11,7 @@ const port = process.env.PORT || 3000;
 // Configuration
 const VLLM_ENDPOINT = `${process.env.VLLM_ENDPOINT || 'http://localhost:8080'}/v1/chat/completions`;
 const MODEL = process.env.MODEL || 'unsloth/Llama-3.1-8B-Instruct-bnb-4bit';
-const MAX_CONTEXT_LENGTH = process.env.MAX_CONTEXT_LENGTH || 2048;
+const MAX_CONTEXT_LENGTH = process.env.MAX_CONTEXT_LENGTH || 4098;
 const DEFAULT_MAX_TOKENS = 512;
 const BATCH_SIZE = 100;
 const BATCH_INTERVAL = 100;
