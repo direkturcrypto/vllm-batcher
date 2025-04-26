@@ -11,8 +11,8 @@ const port = process.env.PORT || 3000;
 // Configuration
 const VLLM_ENDPOINT = `${process.env.VLLM_ENDPOINT || 'http://localhost:8080'}/v1/chat/completions`;
 const MODEL = process.env.MODEL || 'unsloth/Llama-3.1-8B-Instruct-bnb-4bit';
-const MAX_CONTEXT_LENGTH = process.env.MAX_CONTEXT_LENGTH || 8192;
-const DEFAULT_MAX_TOKENS = 2048;
+const MAX_CONTEXT_LENGTH = process.env.MAX_CONTEXT_LENGTH || 2048;
+const DEFAULT_MAX_TOKENS = 512;
 const BATCH_SIZE = 100;
 const BATCH_INTERVAL = 100;
 const MAX_QUEUE_SIZE = 1000;
@@ -307,60 +307,22 @@ function normalizeErrorResponse(error) {
     };
 }
 
-// Add a function to inject the minimum word rule into system messages
-function injectMinimumWordRule(messages) {
-    if (!Array.isArray(messages)) return messages;
-    
-    // The rule we want to inject
-    const minimumWordRule = "\nRules:\n-always reply minimum 1000 words";
-    
-    // Look for a system message
-    let hasSystemMessage = false;
-    
-    // First pass: modify existing system message if found
-    for (let i = 0; i < messages.length; i++) {
-        if (messages[i].role === 'system') {
-            hasSystemMessage = true;
-            // Check if the rule is already present to avoid duplication
-            if (!messages[i].content.includes(minimumWordRule)) {
-                messages[i].content += minimumWordRule;
-            }
-        }
-    }
-    
-    // If no system message was found, add one at the beginning
-    if (!hasSystemMessage) {
-        messages.unshift({
-            role: 'system',
-            content: `You are a helpful assistant.${minimumWordRule}`
-        });
-    }
-    
-    return messages;
-}
-
-// Update the forwardToOpenRouter function to inject the rule
+// Update the forwardToOpenRouter function
 async function forwardToOpenRouter(req, isStream = false) {
     try {
-        // Clone the request body to avoid modifying the original
-        const modifiedBody = { ...req.body };
-        
-        // Inject the minimum word rule
-        modifiedBody.messages = injectMinimumWordRule([...modifiedBody.messages]);
-        
         const openRouterReq = {
             model: OPENROUTER_MODEL,
-            messages: modifiedBody.messages,
+            messages: req.body.messages,
             stream: isStream,
-            max_tokens: DEFAULT_MAX_TOKENS > modifiedBody.max_tokens ? DEFAULT_MAX_TOKENS : modifiedBody.max_tokens,
-            temperature: modifiedBody.temperature || 0.7,
-            top_p: modifiedBody.top_p || 1.0,
-            n: modifiedBody.n || 1,
-            stop: modifiedBody.stop,
-            presence_penalty: modifiedBody.presence_penalty || 0.0,
-            frequency_penalty: modifiedBody.frequency_penalty || 0.0,
-            logit_bias: modifiedBody.logit_bias,
-            user: modifiedBody.user
+            max_tokens: DEFAULT_MAX_TOKENS > req.body.max_tokens ? DEFAULT_MAX_TOKENS : req.body.max_tokens,
+            temperature: req.body.temperature || 0.7,
+            top_p: req.body.top_p || 1.0,
+            n: req.body.n || 1,
+            stop: req.body.stop,
+            presence_penalty: req.body.presence_penalty || 0.0,
+            frequency_penalty: req.body.frequency_penalty || 0.0,
+            logit_bias: req.body.logit_bias,
+            user: req.body.user
         };
 
         if (isStream) {
@@ -443,13 +405,8 @@ async function processBatch() {
     const batch = [];
     while (requestQueue.length > 0 && batch.length < BATCH_SIZE) {
         const req = requestQueue[0];
-        
-        // Clone and inject rule before estimating tokens
-        const modifiedBody = { ...req.body };
-        modifiedBody.messages = injectMinimumWordRule([...modifiedBody.messages]);
-        
-        const estimatedTokens = estimateTokens(modifiedBody.messages) + 
-            (DEFAULT_MAX_TOKENS > modifiedBody.max_tokens ? DEFAULT_MAX_TOKENS : modifiedBody.max_tokens);
+        const estimatedTokens = estimateTokens(req.body.messages) + 
+            (DEFAULT_MAX_TOKENS > req.body.max_tokens ? DEFAULT_MAX_TOKENS : req.body.max_tokens);
         
         // Check if fallback should be used
         const tooManyWaitingRequests = vllmWaitingRequests >= RUNTIME_CONFIG.MAX_VLLM_WAITING_REQUESTS;
@@ -485,20 +442,17 @@ async function processBatch() {
             break;
         }
         
-        batch.push({
-            originalReq: requestQueue.shift(),
-            modifiedBody: modifiedBody
-        });
+        batch.push(requestQueue.shift());
         currentBatchTokens += estimatedTokens;
     }
     
     if (batch.length === 0) return;
 
     try {
-        const requests = batch.map(({ modifiedBody }) => {
-            const normalizedMessages = normalizeMessages(modifiedBody.messages);
+        const requests = batch.map(req => {
+            const normalizedMessages = normalizeMessages(req.body.messages);
             const maxTokens = Math.min(
-                DEFAULT_MAX_TOKENS > modifiedBody.max_tokens ? DEFAULT_MAX_TOKENS : modifiedBody.max_tokens,
+                DEFAULT_MAX_TOKENS > req.body.max_tokens ? DEFAULT_MAX_TOKENS : req.body.max_tokens,
                 MAX_CONTEXT_LENGTH - 1000
             );
 
@@ -507,14 +461,14 @@ async function processBatch() {
                 messages: normalizedMessages,
                 stream: false,
                 max_tokens: maxTokens,
-                temperature: modifiedBody.temperature || 0.7,
-                top_p: modifiedBody.top_p || 1.0,
-                n: modifiedBody.n || 1,
-                stop: modifiedBody.stop,
-                presence_penalty: modifiedBody.presence_penalty || 0.0,
-                frequency_penalty: modifiedBody.frequency_penalty || 0.0,
-                logit_bias: modifiedBody.logit_bias,
-                user: modifiedBody.user
+                temperature: req.body.temperature || 0.7,
+                top_p: req.body.top_p || 1.0,
+                n: req.body.n || 1,
+                stop: req.body.stop,
+                presence_penalty: req.body.presence_penalty || 0.0,
+                frequency_penalty: req.body.frequency_penalty || 0.0,
+                logit_bias: req.body.logit_bias,
+                user: req.body.user
             };
         });
 
@@ -546,15 +500,15 @@ async function processBatch() {
         await Promise.all(
             responses.map(({ index, data, error }) => {
                 if (error) {
-                    return batch[index].originalReq.reject(error);
+                    return batch[index].reject(error);
                 } else {
-                    return batch[index].originalReq.resolve(data);
+                    return batch[index].resolve(data);
                 }
             })
         );
     } catch (error) {
         await Promise.all(
-            batch.map(({ originalReq }) => {
+            batch.map(req => {
                 // Standardize error format
                 const errorResponse = {
                     error: {
@@ -563,7 +517,7 @@ async function processBatch() {
                         code: error.response?.status || 500
                     }
                 };
-                originalReq.reject(errorResponse);
+                req.reject(errorResponse);
             })
         );
     } finally {
@@ -585,13 +539,8 @@ async function processStreamBatch() {
     const batch = [];
     while (streamRequestQueue.length > 0 && batch.length < BATCH_SIZE) {
         const req = streamRequestQueue[0];
-        
-        // Clone and inject rule before estimating tokens
-        const modifiedBody = { ...req.body };
-        modifiedBody.messages = injectMinimumWordRule([...modifiedBody.messages]);
-        
-        const estimatedTokens = estimateTokens(modifiedBody.messages) + 
-            (DEFAULT_MAX_TOKENS > modifiedBody.max_tokens ? DEFAULT_MAX_TOKENS : modifiedBody.max_tokens);
+        const estimatedTokens = estimateTokens(req.body.messages) + 
+            (DEFAULT_MAX_TOKENS > req.body.max_tokens ? DEFAULT_MAX_TOKENS : req.body.max_tokens);
         
         // Check if fallback should be used
         const tooManyWaitingRequests = vllmWaitingRequests >= RUNTIME_CONFIG.MAX_VLLM_WAITING_REQUESTS;
@@ -602,9 +551,6 @@ async function processStreamBatch() {
             try {
                 const reason = contextTooLarge ? 'Context length exceeded' : 'Too many waiting requests';
                 console.log(`Forwarding to OpenRouter from stream batch: ${reason}`);
-                
-                // Use modified body with rule injected
-                reqData.body = modifiedBody;
                 
                 const openRouterStream = await forwardToOpenRouter(reqData, true);
                 const { res } = reqData;
@@ -700,21 +646,17 @@ async function processStreamBatch() {
             break;
         }
         
-        // Store both original request and modified body
-        batch.push({
-            originalReq: streamRequestQueue.shift(),
-            modifiedBody: modifiedBody
-        });
+        batch.push(streamRequestQueue.shift());
         currentBatchTokens += estimatedTokens;
     }
     
     if (batch.length === 0) return;
 
     try {
-        const requests = batch.map(({ modifiedBody }) => {
-            const normalizedMessages = normalizeMessages(modifiedBody.messages);
+        const requests = batch.map(req => {
+            const normalizedMessages = normalizeMessages(req.body.messages);
             const maxTokens = Math.min(
-                DEFAULT_MAX_TOKENS > modifiedBody.max_tokens ? DEFAULT_MAX_TOKENS : modifiedBody.max_tokens,
+                DEFAULT_MAX_TOKENS > req.body.max_tokens ? DEFAULT_MAX_TOKENS : req.body.max_tokens,
                 MAX_CONTEXT_LENGTH - 1000
             );
 
@@ -723,14 +665,14 @@ async function processStreamBatch() {
                 messages: normalizedMessages,
                 stream: true,
                 max_tokens: maxTokens,
-                temperature: modifiedBody.temperature || 0.7,
-                top_p: modifiedBody.top_p || 1.0,
-                n: modifiedBody.n || 1,
-                stop: modifiedBody.stop,
-                presence_penalty: modifiedBody.presence_penalty || 0.0,
-                frequency_penalty: modifiedBody.frequency_penalty || 0.0,
-                logit_bias: modifiedBody.logit_bias,
-                user: modifiedBody.user
+                temperature: req.body.temperature || 0.7,
+                top_p: req.body.top_p || 1.0,
+                n: req.body.n || 1,
+                stop: req.body.stop,
+                presence_penalty: req.body.presence_penalty || 0.0,
+                frequency_penalty: req.body.frequency_penalty || 0.0,
+                logit_bias: req.body.logit_bias,
+                user: req.body.user
             };
         });
 
@@ -788,7 +730,7 @@ async function processStreamBatch() {
         // Handle all responses in parallel
         await Promise.all(
             responses.map(({ index, data, error }) => {
-                const { res } = batch[index].originalReq;
+                const { res } = batch[index];
                 let isEnded = false;
 
                 res.setHeader('Content-Type', 'text/event-stream');
@@ -894,8 +836,8 @@ async function processStreamBatch() {
         );
     } catch (error) {
         await Promise.all(
-            batch.map(({ originalReq }) => {
-                if (!originalReq.res.writableEnded) {
+            batch.map(req => {
+                if (!req.res.writableEnded) {
                     // Standardize error format
                     const errorResponse = {
                         error: {
@@ -903,8 +845,8 @@ async function processStreamBatch() {
                             type: 'batch_processing_error'
                         }
                     };
-                    originalReq.res.write(`data: ${JSON.stringify(errorResponse)}\n\n`);
-                    originalReq.res.end();
+                    req.res.write(`data: ${JSON.stringify(errorResponse)}\n\n`);
+                    req.res.end();
                 }
             })
         );
@@ -922,14 +864,10 @@ app.post('/v1/chat/completions', async (req, res) => {
         // Increment activeRequests to track pending requests more accurately
         activeRequests++;
         
-        // Clone and inject rule before estimating tokens
-        const modifiedBody = { ...req.body };
-        modifiedBody.messages = injectMinimumWordRule([...modifiedBody.messages]);
-        
         // Check conditions for OpenRouter fallback
         const totalQueueSize = requestQueue.length + streamRequestQueue.length;
-        const estimatedTokens = estimateTokens(modifiedBody.messages) + 
-            (DEFAULT_MAX_TOKENS > modifiedBody.max_tokens ? DEFAULT_MAX_TOKENS : modifiedBody.max_tokens);
+        const estimatedTokens = estimateTokens(req.body.messages) + 
+            (DEFAULT_MAX_TOKENS > req.body.max_tokens ? DEFAULT_MAX_TOKENS : req.body.max_tokens);
         const tooManyWaitingRequests = vllmWaitingRequests >= RUNTIME_CONFIG.MAX_VLLM_WAITING_REQUESTS;
         const queueFull = totalQueueSize >= MAX_QUEUE_SIZE;
         const contextTooLarge = estimatedTokens > MAX_CONTEXT_LENGTH;
@@ -1058,14 +996,14 @@ app.post('/v1/chat/completions', async (req, res) => {
         }
 
         if (req.body.stream) {
-            streamRequestQueue.push({ body: modifiedBody, res });
+            streamRequestQueue.push({ body: req.body, res });
             if (streamRequestQueue.length === 1) {
                 processStreamBatch();
             }
         } else {
             const response = await new Promise((resolve, reject) => {
                 requestQueue.push({
-                    body: modifiedBody,
+                    body: req.body,
                     resolve,
                     reject
                 });
