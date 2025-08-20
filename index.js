@@ -259,6 +259,7 @@ function normalizeStreamChunk(chunk, source = 'vllm') {
             normalizedChunk.choices = data.choices.map(choice => {
                 const normalizedChoice = {
                     index: choice.index || 0,
+                    logprobs: choice.logprobs || null,
                     finish_reason: choice.finish_reason || null
                 };
 
@@ -266,7 +267,7 @@ function normalizeStreamChunk(chunk, source = 'vllm') {
                 if (choice.delta) {
                     normalizedChoice.delta = {
                         role: choice.delta.role || undefined,
-                        content: choice.delta.content || ''
+                        content: choice.delta.content || '',
                     };
                     
                     // Remove undefined fields
