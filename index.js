@@ -704,6 +704,7 @@ async function processStreamBatch() {
                 model: MODEL,
                 messages: normalizedMessages,
                 stream: true,
+                stream_options: {include_usage: true},
                 logprobs: req.body.logprobs || false,
                 top_logprobs: req.body.top_logprobs || 0,
                 max_tokens: maxTokens,
