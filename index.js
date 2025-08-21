@@ -253,6 +253,9 @@ function normalizeStreamChunk(chunk, source = 'vllm') {
             model: data.model || (source === 'vllm' ? MODEL : OPENROUTER_MODEL),
             choices: []
         };
+        if (data.usage) {
+            normalizedChunk.usage = data.usage
+        }
 
         // Normalize choices
         if (data.choices && Array.isArray(data.choices)) {
