@@ -1,7 +1,7 @@
 #!/bin/bash
 
-MODEL_REPO="unsloth/Llama-3.1-8B-Instruct-bnb-4bit"
-ALIAS_NAME="llama3.1-8b"
+MODEL_REPO="context-labs/meta-llama-Llama-3.2-3B-Instruct-FP16"
+ALIAS_NAME="llama3.2-3b"
 VENV_DIR="vllm_env"
 PORT=8080
 CONFIG_FILE="models_config.json"
