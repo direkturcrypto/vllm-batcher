@@ -44,7 +44,7 @@ EOF
     --disable-log-requests \
     --max-num-seqs 100 \
     --gpu-memory-utilization 0.9 \
-    --max-model-len 8192 \
+    --max-model-len 16384 \
     > "$LOGFILE" 2>&1 &
 
   echo "✅ vLLM running on http://localhost:$PORT"
