@@ -508,7 +508,8 @@ async function processBatch() {
                 presence_penalty: req.body.presence_penalty || 0.0,
                 frequency_penalty: req.body.frequency_penalty || 0.0,
                 logit_bias: req.body.logit_bias,
-                user: req.body.user
+                user: req.body.user,
+                return_tokens_as_token_ids: true
             };
         });
 
@@ -718,7 +719,8 @@ async function processStreamBatch() {
                 presence_penalty: req.body.presence_penalty || 0.0,
                 frequency_penalty: req.body.frequency_penalty || 0.0,
                 logit_bias: req.body.logit_bias,
-                user: req.body.user
+                user: req.body.user,
+                return_tokens_as_token_ids: true
             };
         });
 
